@@ -76,22 +76,22 @@ const (
 )
 
 const (
-    InputModeMouse = iota + 1
-    InputModeTouch
-    InputModeGamePad
+	InputModeMouse = iota + 1
+	InputModeTouch
+	InputModeGamePad
 )
 
 const (
-    PlayModeNormal = iota
-    PlayModeTeaser
-    PlayModeScreen
-    _
-    _
-    _
-    _
-    PlayModeExitLevel
-    _
-    PlayModeNumModes
+	PlayModeNormal = iota
+	PlayModeTeaser
+	PlayModeScreen
+	_
+	_
+	_
+	_
+	PlayModeExitLevel
+	_
+	PlayModeNumModes
 )
 
 const (
