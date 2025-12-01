@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -619,6 +620,7 @@ func (conn *Conn) deferPacket(pk decodeablePacket) {
 func (conn *Conn) receive(data []byte) error {
 	pkData, err := ParseData(data)
 	if err != nil {
+		conn.log.Error("receive: ParseData failed", "err", err.Error(), "dataLen", len(data))
 		return err
 	}
 	if conn.packetFunc != nil {
@@ -631,6 +633,7 @@ func (conn *Conn) receive(data []byte) error {
 		if err != nil {
 			return err
 		}
+		conn.log.Debug("receive: got Disconnect packet from server, closing")
 		_ = conn.close(conn.closeErr(pks[0].(*packet.Disconnect).Message))
 		return nil
 	}
@@ -659,6 +662,7 @@ func (conn *Conn) handle(pkData *packetData) error {
 			// If the packet was expected, so we handle it right now.
 			pks, err := pkData.decode(conn)
 			if err != nil {
+				conn.log.Error("handle: decode failed for expected packet", "packetID", pkData.Header.PacketID, "err", err.Error())
 				return err
 			}
 			return conn.handleMultiple(pks)
@@ -696,6 +700,7 @@ func (conn *Conn) handleMultiple(pks []packet.Packet) error {
 	var err error
 	for _, pk := range pks {
 		if e := conn.handlePacket(pk); e != nil {
+			conn.log.Error("handleMultiple: handlePacket returned error", "type", fmt.Sprintf("%T", pk), "err", e.Error())
 			err = fmt.Errorf("handle %T: %w", pk, e)
 		}
 	}
@@ -765,6 +770,7 @@ func (conn *Conn) handleRequestNetworkSettings(pk *packet.RequestNetworkSettings
 		}
 	}
 	if !found {
+		conn.log.Error("handleRequestNetworkSettings: protocol mismatch", "clientProtocol", pk.ClientProtocol, "currentProtocol", protocol.CurrentProtocol, "acceptedProtos", len(conn.acceptedProto))
 		status := packet.PlayStatusLoginFailedClient
 		if pk.ClientProtocol > protocol.CurrentProtocol {
 			// The server is outdated in this case, so we have to change the status we send.
@@ -1178,7 +1184,17 @@ func (conn *Conn) expect(packetIDs ...uint32) {
 func (conn *Conn) close(cause error) error {
 	var err error
 	conn.once.Do(func() {
+		// Log the reason and stack trace when a connection is closed so we can
+		// diagnose races where a connection is closed immediately after being
+		// established ("use of closed network connection").
+		if cause != nil {
+			conn.log.Error("conn.close called", "cause", cause.Error(), "stack", string(debug.Stack()))
+		} else {
+			conn.log.Debug("conn.close called", "stack", string(debug.Stack()))
+		}
 		err = conn.Flush()
+		// Cancel the connection context with the provided cause, then close the
+		// underlying net.Conn.
 		conn.cancelFunc(cause)
 		_ = conn.conn.Close()
 	})

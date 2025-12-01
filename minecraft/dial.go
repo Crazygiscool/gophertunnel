@@ -225,19 +225,82 @@ func (d Dialer) DialContext(ctx context.Context, network, address string, initia
 		return nil, &net.OpError{Op: "dial", Net: "minecraft", Err: fmt.Errorf("dial: no network under id %v", network)}
 	}
 
-	ctxt, cancel := context.WithTimeout(ctx, initialTimeout)
-	defer cancel()
+	// per-attempt contexts are used below; no global ctxt required here.
 
 	var pong []byte
 	var netConn net.Conn
-	if pong, err = n.PingContext(ctxt, address); err == nil {
-		netConn, err = n.DialContext(ctxt, addressWithPongPort(pong, address))
-	} else {
-		netConn, err = n.DialContext(ctxt, address)
+
+	// Robust dialing: try DNS resolution, prefer pong redirected port, and retry
+	// a small number of times with exponential backoff. This helps in flaky
+	// network environments and surfaces clearer log messages for timeouts.
+	var lastErr error
+	attempts := 3
+	baseBackoff := 300 * time.Millisecond
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, initialTimeout)
+
+		d.ErrorLog.Info("dial: attempt", "attempt", attempt, "attempts", attempts, "network", network, "address", address)
+
+		// Resolve host->IPs when possible so we can try direct IP connects.
+		var candidates []string
+		if host, port, errSplit := net.SplitHostPort(address); errSplit == nil {
+			if ips, errLookup := net.LookupIP(host); errLookup == nil && len(ips) > 0 {
+				d.ErrorLog.Debug("dial: lookup successful", "host", host, "ips", len(ips))
+				for _, ip := range ips {
+					candidates = append(candidates, net.JoinHostPort(ip.String(), port))
+				}
+			} else if errLookup != nil {
+				d.ErrorLog.Debug("dial: lookup failed", "host", host, "err", errLookup.Error())
+			}
+		} else {
+			d.ErrorLog.Debug("dial: address not in host:port form", "address", address)
+		}
+
+		// If ping works, prefer any pong-derived redirect address.
+		if pong, err = n.PingContext(attemptCtx, address); err == nil {
+			d.ErrorLog.Debug("dial: ping success", "pong", string(pong))
+			redirect := addressWithPongPort(pong, address)
+			candidates = append([]string{redirect}, candidates...)
+		} else {
+			d.ErrorLog.Debug("dial: ping failed", "err", err.Error())
+		}
+
+		// Always try the original address as a fallback.
+		candidates = append(candidates, address)
+
+		// Try each candidate until one succeeds.
+		for _, tryAddr := range candidates {
+			d.ErrorLog.Debug("dial: trying", "addr", tryAddr)
+			netConn, err = n.DialContext(attemptCtx, tryAddr)
+			if err == nil {
+				d.ErrorLog.Info("dial: connected", "addr", tryAddr)
+				if netConn != nil {
+					d.ErrorLog.Debug("dial: connection addrs", "local", netConn.LocalAddr().String(), "remote", netConn.RemoteAddr().String())
+				}
+				attemptCancel()
+				lastErr = nil
+				goto dial_setup
+			}
+			d.ErrorLog.Debug("dial: connect failed", "addr", tryAddr, "err", err.Error())
+			lastErr = err
+		}
+
+		attemptCancel()
+		if attempt < attempts {
+			sleep := baseBackoff * time.Duration(1<<uint(attempt-1))
+			d.ErrorLog.Info("dial: retrying", "sleep", sleep)
+			time.Sleep(sleep)
+		}
 	}
-	if err != nil {
-		return nil, err
+
+	if lastErr != nil {
+		d.ErrorLog.Error("dial: all attempts failed", "err", lastErr.Error(), "network", network, "address", address)
+		return nil, lastErr
 	}
+	return nil, fmt.Errorf("dial: failed to connect to %s", address)
+
+dial_setup:
 
 	if d.GetClientData != nil {
 		d.clientData = d.GetClientData()
@@ -297,9 +360,14 @@ func (d Dialer) DialContext(ctx context.Context, network, address string, initia
 
 	readyForLogin, connected := make(chan struct{}), make(chan struct{})
 	ctx, cancelCause := context.WithCancelCause(ctx)
+	// Give listenConn a moment to fully initialize its decode loop before we
+	// send the first packet. This reduces races where the first packet arrives
+	// before listenConn is ready to receive packets.
 	go listenConn(conn, readyForLogin, connected, cancelCause)
+	time.Sleep(10 * time.Millisecond)
 
 	conn.expect(packet.IDNetworkSettings, packet.IDPlayStatus)
+	d.ErrorLog.Debug("dial: sending RequestNetworkSettings")
 	if err := conn.WritePacket(&packet.RequestNetworkSettings{ClientProtocol: d.Protocol.ID()}); err != nil {
 		return nil, conn.wrap(fmt.Errorf("send request network settings: %w", err), "dial")
 	}
@@ -369,12 +437,19 @@ func listenConn(conn *Conn, readyForLogin, connected chan struct{}, cancel conte
 		// and push them to the Conn so that they may be processed.
 		packets, err := conn.dec.Decode()
 		if err != nil {
+			// Log detailed info about the decode error and whether we'll cancel the
+			// dial context. This helps debug "use of closed network connection" races
+			// where the underlying socket is closed while the goroutine is still
+			// starting up.
 			if !errors.Is(err, net.ErrClosed) {
 				if cancelContext {
+					conn.log.Error("listenConn: decode error, cancelling dial", "err", err.Error())
 					cancel(err)
 				} else {
-					conn.log.Error(err.Error())
+					conn.log.Error("listenConn: decode error", "err", err.Error())
 				}
+			} else {
+				conn.log.Debug("listenConn: decode returned ErrClosed")
 			}
 			return
 		}
